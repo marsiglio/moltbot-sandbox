@@ -214,15 +214,29 @@ app.route('/debug', debug);
 // CATCH-ALL: Proxy to Moltbot gateway
 // =============================================================================
 
+/** Paths that require the gateway (Control UI, WebSocket, gateway proxy). Skip ensure for others. */
+function pathNeedsGateway(pathname: string): boolean {
+  if (pathname.startsWith('/_admin') || pathname.startsWith('/debug')) return false;
+  if (pathname === '/api/status' || pathname === '/sandbox-health') return false;
+  if (pathname === '/logo.png' || pathname === '/logo-small.png') return false;
+  return true;
+}
+
 app.all('*', async (c) => {
   const sandbox = c.get('sandbox');
   const request = c.req.raw;
   const url = new URL(request.url);
+  const pathname = url.pathname;
 
-  console.log('[PROXY] Handling request:', url.pathname);
+  console.log('[PROXY] Handling request:', pathname);
 
   const isWebSocketRequest = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
   const acceptsHtml = request.headers.get('Accept')?.includes('text/html');
+
+  // Only ensure gateway for routes that require the container (Control UI, WS, gateway paths)
+  if (!pathNeedsGateway(pathname)) {
+    return c.json({ error: 'Not found' }, 404);
+  }
 
   // Ensure gateway is running (single-owner via GatewayState DO when bound)
   try {
@@ -337,29 +351,34 @@ app.all('*', async (c) => {
       }
     });
 
-    // Handle close events (never send 1006 to container; use 1012 or 1000)
+    // Handle close events (1006/1005 are invalid to send; omit code and just close)
     serverWs.addEventListener('close', (event) => {
       if (debugLogs) {
         console.log('[WS] Client closed:', event.code, event.reason);
       }
-      const code = event.code === 1006 ? 1012 : event.code;
-      containerWs.close(code, event.reason);
+      if (event.code === 1006 || event.code === 1005) {
+        containerWs.close();
+      } else {
+        containerWs.close(event.code, event.reason);
+      }
     });
 
     containerWs.addEventListener('close', (event) => {
       if (debugLogs) {
         console.log('[WS] Container closed:', event.code, event.reason);
       }
-      // Never send close code 1006 (reserved); use 1012 (Service Restart) or 1000 (Normal Closure)
-      const code = event.code === 1006 ? 1012 : event.code;
       let reason = transformErrorMessage(event.reason, url.host);
       if (reason.length > 123) {
         reason = reason.slice(0, 120) + '...';
       }
-      if (debugLogs) {
-        console.log('[WS] Transformed close code/reason:', code, reason);
+      if (event.code === 1006 || event.code === 1005) {
+        serverWs.close();
+      } else {
+        if (debugLogs) {
+          console.log('[WS] Forwarding close code/reason:', event.code, reason);
+        }
+        serverWs.close(event.code, reason);
       }
-      serverWs.close(code, reason);
     });
 
     // Handle errors

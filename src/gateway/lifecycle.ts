@@ -21,34 +21,54 @@ export interface GatewayStateRef {
 
 const GATEWAY_WS_URL = 'ws://localhost:18789';
 const CLAWDBOT_DATA_DIR = '/root/.clawdbot';
+const GATEWAY_LOCK_PATHS = [
+  '/tmp/clawdbot-gateway.lock',
+  `${CLAWDBOT_DATA_DIR}/gateway.lock`,
+] as const;
 const STOP_GRACEFUL_TIMEOUT_MS = 10_000;
-const PORT_FREE_WAIT_MS = 3_000;
+const HEALTH_CHECK_TIMEOUT_MS = 500;
+const PORT_FREE_POLL_MS = 500;
+const PORT_FREE_DEADLINE_MS = 15_000;
 
 /**
- * Lightweight health check: if the gateway responds on port 18789, treat as running.
- * Tries HTTP GET first; avoids starting a new gateway when one is already up.
+ * Health check: connection succeeded, status not 5xx, and within timeout.
+ * Avoids treating proxy errors or unrelated listeners as healthy.
  */
 export async function isGatewayHealthy(sandbox: Sandbox): Promise<boolean> {
   try {
     const url = `http://localhost:${MOLTBOT_PORT}/`;
-    const res = await sandbox.containerFetch(new Request(url), MOLTBOT_PORT);
-    // Any response (including 4xx/5xx) means the gateway is listening
-    return res.status > 0;
+    const res = await Promise.race([
+      sandbox.containerFetch(new Request(url), MOLTBOT_PORT),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('health check timeout')), HEALTH_CHECK_TIMEOUT_MS)
+      ),
+    ]);
+    // Connection succeeded; treat as unhealthy if 5xx (server error)
+    return res.status >= 200 && res.status < 500;
   } catch {
     return false;
   }
 }
 
 /**
- * Clear *.lock files in the clawdbot data directory and known lock paths.
- * Only call after confirming the gateway process has exited.
+ * Clear only the gateway lock files the gateway is known to use.
+ * Do not wildcard; only /tmp/clawdbot-gateway.lock and /root/.clawdbot/gateway.lock.
+ * Call only after confirming the gateway process has exited.
  */
 export async function clearLockFiles(sandbox: Sandbox): Promise<void> {
   try {
-    const proc = await sandbox.startProcess(
-      `rm -f /tmp/clawdbot-gateway.lock "${CLAWDBOT_DATA_DIR}/gateway.lock" ${CLAWDBOT_DATA_DIR}/*.lock 2>/dev/null || true`
-    );
-    await waitForProcess(proc, 5000);
+    for (const lockPath of GATEWAY_LOCK_PATHS) {
+      const proc = await sandbox.startProcess(
+        `test -f "${lockPath}" && echo "${lockPath}" || true`
+      );
+      await waitForProcess(proc, 3000);
+      const logs = await proc.getLogs();
+      if (logs.stdout?.trim() === lockPath) {
+        console.log('[Gateway] Clearing lock file:', lockPath);
+        const rmProc = await sandbox.startProcess(`rm -f "${lockPath}"`);
+        await waitForProcess(rmProc, 3000);
+      }
+    }
   } catch (e) {
     console.log('[Gateway] clearLockFiles error (non-fatal):', e);
   }
@@ -98,16 +118,16 @@ export async function stopGateway(
 }
 
 /**
- * Wait until port 18789 is free (no listener). Polls with a short timeout.
+ * Wait until port 18789 is free (no listener). Poll until health check fails or deadline.
  */
 async function waitForPortFree(sandbox: Sandbox): Promise<void> {
-  await new Promise((r) => setTimeout(r, PORT_FREE_WAIT_MS));
-  const deadline = Date.now() + 15_000;
+  const deadline = Date.now() + PORT_FREE_DEADLINE_MS;
   while (Date.now() < deadline) {
     const healthy = await isGatewayHealthy(sandbox);
     if (!healthy) return;
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, PORT_FREE_POLL_MS));
   }
+  console.log('[Gateway] waitForPortFree timed out; proceeding anyway');
 }
 
 /**
@@ -125,12 +145,20 @@ export async function ensureGatewayRunningLogic(
     return;
   }
 
-  // 2) Lightweight health check before starting
+  // 2) Health check before starting (connection + status not 5xx + timeout)
   if (await isGatewayHealthy(sandbox)) {
     stateRef.gatewayReady = true;
     stateRef.lastHealthCheck = Date.now();
-    const existing = await findExistingMoltbotProcess(sandbox);
-    if (existing) stateRef.gatewayProcessId = existing.id;
+    // Populate processId so state and restart work; retry once for eventual consistency
+    let existing = await findExistingMoltbotProcess(sandbox);
+    if (!existing) {
+      await new Promise((r) => setTimeout(r, 300));
+      existing = await findExistingMoltbotProcess(sandbox);
+    }
+    if (existing) {
+      stateRef.gatewayProcessId = existing.id;
+      stateRef.lastGatewayStartAttempt = Date.now();
+    }
     console.log('[Gateway] gateway already healthy (health check), processId:', stateRef.gatewayProcessId);
     return;
   }
@@ -157,10 +185,18 @@ export async function ensureGatewayRunningLogic(
     }
   }
 
-  // 4) Mount R2 (do not start gateway here; only ensure mount for startup script)
+  // 4) Port in use but unhealthy or we lost processId: kill any gateway and free port
+  if (await isGatewayHealthy(sandbox)) {
+    console.log('[Gateway] Port in use but no process tracked; attempting kill/fixup');
+    await stopGateway(sandbox, stateRef.gatewayProcessId);
+    stateRef.gatewayProcessId = null;
+    await waitForPortFree(sandbox);
+  }
+
+  // 5) Mount R2 (do not start gateway here; only ensure mount for startup script)
   await mountR2Storage(sandbox, env);
 
-  // 5) Start new gateway
+  // 6) Start new gateway
   stateRef.lastGatewayStartAttempt = Date.now();
   console.log('[Gateway] Starting gateway...');
   const envVars = buildEnvVars(env);

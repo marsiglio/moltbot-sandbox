@@ -2,25 +2,43 @@ import type { Sandbox } from '@cloudflare/sandbox';
 import type { MoltbotEnv } from '../types';
 import { R2_MOUNT_PATH, getR2BucketName } from '../config';
 
+/** Cache mount check for 2 minutes to avoid spawning `mount | grep` per request */
+const MOUNT_CHECK_CACHE_MS = 120_000;
+let lastMountCheckTime = 0;
+let lastMountResult = false;
+
+/** Reset mount cache (for tests) */
+export function resetR2MountCache(): void {
+  lastMountCheckTime = 0;
+  lastMountResult = false;
+}
+
 /**
- * Check if R2 is already mounted by looking at the mount table
+ * Check if R2 is already mounted by looking at the mount table.
+ * Result is cached for MOUNT_CHECK_CACHE_MS to reduce process churn.
  */
 async function isR2Mounted(sandbox: Sandbox): Promise<boolean> {
+  const now = Date.now();
+  if (now - lastMountCheckTime < MOUNT_CHECK_CACHE_MS) {
+    return lastMountResult;
+  }
   try {
     const proc = await sandbox.startProcess(`mount | grep "s3fs on ${R2_MOUNT_PATH}"`);
-    // Wait for the command to complete
     let attempts = 0;
     while (proc.status === 'running' && attempts < 10) {
       await new Promise(r => setTimeout(r, 200));
       attempts++;
     }
     const logs = await proc.getLogs();
-    // If stdout has content, the mount exists
     const mounted = !!(logs.stdout && logs.stdout.includes('s3fs'));
+    lastMountCheckTime = Date.now();
+    lastMountResult = mounted;
     console.log('isR2Mounted check:', mounted, 'stdout:', logs.stdout?.slice(0, 100));
     return mounted;
   } catch (err) {
     console.log('isR2Mounted error:', err);
+    lastMountCheckTime = Date.now();
+    lastMountResult = false;
     return false;
   }
 }
@@ -62,7 +80,8 @@ export async function mountR2Storage(sandbox: Sandbox, env: MoltbotEnv): Promise
     const errorMessage = err instanceof Error ? err.message : String(err);
     console.log('R2 mount error:', errorMessage);
     
-    // Check again if it's mounted - the error might be misleading
+    // Check again if it's mounted - the error might be misleading (bypass cache)
+    resetR2MountCache();
     if (await isR2Mounted(sandbox)) {
       console.log('R2 bucket is mounted despite error');
       return true;

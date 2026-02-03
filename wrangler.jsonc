@@ -47,12 +47,20 @@
         "class_name": "Sandbox",
         "name": "Sandbox",
       },
+      {
+        "class_name": "GatewayState",
+        "name": "GatewayState",
+      },
     ],
   },
   "migrations": [
     {
       "new_sqlite_classes": ["Sandbox"],
       "tag": "v1",
+    },
+    {
+      "new_sqlite_classes": ["GatewayState"],
+      "tag": "v2",
     },
   ],
   // R2 bucket for persistent storage (moltbot data, conversations, etc.)

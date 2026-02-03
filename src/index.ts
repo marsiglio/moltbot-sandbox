@@ -21,16 +21,20 @@
  */
 
 import { Hono } from 'hono';
-import { getSandbox, Sandbox, type SandboxOptions } from '@cloudflare/sandbox';
+import { getSandbox, Sandbox } from '@cloudflare/sandbox';
 
 import type { AppEnv, MoltbotEnv } from './types';
 import { MOLTBOT_PORT } from './config';
 import { createAccessMiddleware } from './auth';
-import { ensureMoltbotGateway, findExistingMoltbotProcess, syncToR2 } from './gateway';
+import { ensureMoltbotGateway, syncToR2 } from './gateway';
+import { buildSandboxOptions } from './gateway/sandbox-options';
 import { publicRoutes, api, adminUi, debug, cdp } from './routes';
 import { redactSensitiveParams } from './utils/logging';
 import loadingPageHtml from './assets/loading.html';
 import configErrorHtml from './assets/config-error.html';
+
+export { Sandbox };
+export { GatewayState } from './gateway/state-do';
 
 /**
  * Transform error messages from the gateway to be more user-friendly.
@@ -47,7 +51,22 @@ function transformErrorMessage(message: string, host: string): string {
   return message;
 }
 
-export { Sandbox };
+/**
+ * Call GatewayState DO to ensure gateway is running. Uses DO when bound; otherwise falls back to ensureMoltbotGateway.
+ */
+async function ensureGatewayRunning(env: MoltbotEnv, sandbox: Sandbox): Promise<void> {
+  if (env.GatewayState) {
+    const id = env.GatewayState.idFromName('moltbot');
+    const stub = env.GatewayState.get(id);
+    const res = await stub.fetch(new Request('http://do/ensure', { method: 'POST' }));
+    if (!res.ok) {
+      const body = (await res.json()) as { error?: string };
+      throw new Error(body.error || res.statusText);
+    }
+    return;
+  }
+  await ensureMoltbotGateway(sandbox, env);
+}
 
 /**
  * Validate required environment variables.
@@ -84,29 +103,6 @@ function validateRequiredEnv(env: MoltbotEnv): string[] {
   }
 
   return missing;
-}
-
-/**
- * Build sandbox options based on environment configuration.
- * 
- * SANDBOX_SLEEP_AFTER controls how long the container stays alive after inactivity:
- * - 'never' (default): Container stays alive indefinitely (recommended due to long cold starts)
- * - Duration string: e.g., '10m', '1h', '30s' - container sleeps after this period of inactivity
- * 
- * To reduce costs at the expense of cold start latency, set SANDBOX_SLEEP_AFTER to a duration:
- *   npx wrangler secret put SANDBOX_SLEEP_AFTER
- *   # Enter: 10m (or 1h, 30m, etc.)
- */
-function buildSandboxOptions(env: MoltbotEnv): SandboxOptions {
-  const sleepAfter = env.SANDBOX_SLEEP_AFTER?.toLowerCase() || 'never';
-
-  // 'never' means keep the container alive indefinitely
-  if (sleepAfter === 'never') {
-    return { keepAlive: true };
-  }
-
-  // Otherwise, use the specified duration
-  return { sleepAfter };
 }
 
 // Main app
@@ -225,34 +221,19 @@ app.all('*', async (c) => {
 
   console.log('[PROXY] Handling request:', url.pathname);
 
-  // Check if gateway is already running
-  const existingProcess = await findExistingMoltbotProcess(sandbox);
-  const isGatewayReady = existingProcess !== null && existingProcess.status === 'running';
-
-  // For browser requests (non-WebSocket, non-API), show loading page if gateway isn't ready
   const isWebSocketRequest = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
   const acceptsHtml = request.headers.get('Accept')?.includes('text/html');
 
-  if (!isGatewayReady && !isWebSocketRequest && acceptsHtml) {
-    console.log('[PROXY] Gateway not ready, serving loading page');
-
-    // Start the gateway in the background (don't await)
-    c.executionCtx.waitUntil(
-      ensureMoltbotGateway(sandbox, c.env).catch((err: Error) => {
-        console.error('[PROXY] Background gateway start failed:', err);
-      })
-    );
-
-    // Return the loading page immediately
-    return c.html(loadingPageHtml);
-  }
-
-  // Ensure moltbot is running (this will wait for startup)
+  // Ensure gateway is running (single-owner via GatewayState DO when bound)
   try {
-    await ensureMoltbotGateway(sandbox, c.env);
+    await ensureGatewayRunning(c.env, sandbox);
   } catch (error) {
-    console.error('[PROXY] Failed to start Moltbot:', error);
+    console.error('[PROXY] Failed to ensure gateway:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+
+    if (!isWebSocketRequest && acceptsHtml) {
+      return c.html(loadingPageHtml);
+    }
 
     let hint = 'Check worker logs with: wrangler tail';
     if (!c.env.ANTHROPIC_API_KEY) {
@@ -356,27 +337,29 @@ app.all('*', async (c) => {
       }
     });
 
-    // Handle close events
+    // Handle close events (never send 1006 to container; use 1012 or 1000)
     serverWs.addEventListener('close', (event) => {
       if (debugLogs) {
         console.log('[WS] Client closed:', event.code, event.reason);
       }
-      containerWs.close(event.code, event.reason);
+      const code = event.code === 1006 ? 1012 : event.code;
+      containerWs.close(code, event.reason);
     });
 
     containerWs.addEventListener('close', (event) => {
       if (debugLogs) {
         console.log('[WS] Container closed:', event.code, event.reason);
       }
-      // Transform the close reason (truncate to 123 bytes max for WebSocket spec)
+      // Never send close code 1006 (reserved); use 1012 (Service Restart) or 1000 (Normal Closure)
+      const code = event.code === 1006 ? 1012 : event.code;
       let reason = transformErrorMessage(event.reason, url.host);
       if (reason.length > 123) {
         reason = reason.slice(0, 120) + '...';
       }
       if (debugLogs) {
-        console.log('[WS] Transformed close reason:', reason);
+        console.log('[WS] Transformed close code/reason:', code, reason);
       }
-      serverWs.close(event.code, reason);
+      serverWs.close(code, reason);
     });
 
     // Handle errors

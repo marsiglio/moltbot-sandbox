@@ -1,8 +1,23 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { createAccessMiddleware } from '../auth';
-import { ensureMoltbotGateway, findExistingMoltbotProcess, mountR2Storage, syncToR2, waitForProcess } from '../gateway';
+import { ensureMoltbotGateway, mountR2Storage, syncToR2, waitForProcess } from '../gateway';
 import { R2_MOUNT_PATH } from '../config';
+
+/** Call GatewayState DO to ensure gateway; fallback to ensureMoltbotGateway when DO not bound */
+async function ensureGateway(c: { get: (k: string) => unknown; env: AppEnv['Bindings'] }): Promise<void> {
+  if (c.env.GatewayState) {
+    const id = c.env.GatewayState.idFromName('moltbot');
+    const res = await c.env.GatewayState.get(id).fetch(new Request('http://do/ensure', { method: 'POST' }));
+    if (!res.ok) {
+      const body = (await res.json()) as { error?: string };
+      throw new Error(body.error || res.statusText);
+    }
+    return;
+  }
+  const sandbox = c.get('sandbox') as import('@cloudflare/sandbox').Sandbox;
+  await ensureMoltbotGateway(sandbox, c.env);
+}
 
 // CLI commands can take 10-15 seconds to complete due to WebSocket connection overhead
 const CLI_TIMEOUT_MS = 20000;
@@ -25,11 +40,14 @@ adminApi.use('*', createAccessMiddleware({ type: 'json' }));
 
 // GET /api/admin/devices - List pending and paired devices
 adminApi.get('/devices', async (c) => {
+  try {
+    await ensureGateway(c);
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : 'Unknown error' }, 500);
+  }
   const sandbox = c.get('sandbox');
 
   try {
-    // Ensure moltbot is running first
-    await ensureMoltbotGateway(sandbox, c.env);
 
     // Run moltbot CLI to list devices (CLI is still named clawdbot until upstream renames)
     // Must specify --url to connect to the gateway running in the same container
@@ -73,7 +91,6 @@ adminApi.get('/devices', async (c) => {
 
 // POST /api/admin/devices/:requestId/approve - Approve a pending device
 adminApi.post('/devices/:requestId/approve', async (c) => {
-  const sandbox = c.get('sandbox');
   const requestId = c.req.param('requestId');
 
   if (!requestId) {
@@ -81,8 +98,13 @@ adminApi.post('/devices/:requestId/approve', async (c) => {
   }
 
   try {
-    // Ensure moltbot is running first
-    await ensureMoltbotGateway(sandbox, c.env);
+    await ensureGateway(c);
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : 'Unknown error' }, 500);
+  }
+  const sandbox = c.get('sandbox');
+
+  try {
 
     // Run moltbot CLI to approve the device (CLI is still named clawdbot)
     const proc = await sandbox.startProcess(`clawdbot devices approve ${requestId} --url ws://localhost:18789`);
@@ -110,13 +132,15 @@ adminApi.post('/devices/:requestId/approve', async (c) => {
 
 // POST /api/admin/devices/approve-all - Approve all pending devices
 adminApi.post('/devices/approve-all', async (c) => {
+  try {
+    await ensureGateway(c);
+    // First, get the list of pending devices (CLI is still named clawdbot)
+  } catch (e) {
+    return c.json({ error: e instanceof Error ? e.message : 'Unknown error' }, 500);
+  }
   const sandbox = c.get('sandbox');
 
   try {
-    // Ensure moltbot is running first
-    await ensureMoltbotGateway(sandbox, c.env);
-
-    // First, get the list of pending devices (CLI is still named clawdbot)
     const listProc = await sandbox.startProcess('clawdbot devices list --json --url ws://localhost:18789');
     await waitForProcess(listProc, CLI_TIMEOUT_MS);
 
@@ -240,38 +264,42 @@ adminApi.post('/storage/sync', async (c) => {
   }
 });
 
-// POST /api/admin/gateway/restart - Kill the current gateway and start a new one
+// POST /api/admin/gateway/restart - Stop gateway (graceful then force), clear locks, start new one
 adminApi.post('/gateway/restart', async (c) => {
+  if (c.env.GatewayState) {
+    try {
+      const id = c.env.GatewayState.idFromName('moltbot');
+      const res = await c.env.GatewayState.get(id).fetch(new Request('http://do/restart', { method: 'POST' }));
+      const data = (await res.json()) as { ok?: boolean; error?: string; processId?: string; gatewayReady?: boolean };
+      if (!res.ok) {
+        return c.json({ success: false, error: data.error || res.statusText }, 503);
+      }
+      return c.json({
+        success: true,
+        message: 'Restarting gateway...',
+        processId: data.processId,
+        gatewayReady: data.gatewayReady,
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      return c.json({ error: errorMessage }, 500);
+    }
+  }
+  // Fallback when GatewayState DO not bound (e.g. tests)
   const sandbox = c.get('sandbox');
-
   try {
-    // Find and kill the existing gateway process
+    const { findExistingMoltbotProcess } = await import('../gateway');
     const existingProcess = await findExistingMoltbotProcess(sandbox);
-    
     if (existingProcess) {
-      console.log('Killing existing gateway process:', existingProcess.id);
       try {
         await existingProcess.kill();
-      } catch (killErr) {
-        console.error('Error killing process:', killErr);
+      } catch {
+        // ignore
       }
-      // Wait a moment for the process to die
       await new Promise(r => setTimeout(r, 2000));
     }
-
-    // Start a new gateway in the background
-    const bootPromise = ensureMoltbotGateway(sandbox, c.env).catch((err) => {
-      console.error('Gateway restart failed:', err);
-    });
-    c.executionCtx.waitUntil(bootPromise);
-
-    return c.json({
-      success: true,
-      message: existingProcess 
-        ? 'Gateway process killed, new instance starting...'
-        : 'No existing process found, starting new instance...',
-      previousProcessId: existingProcess?.id,
-    });
+    await ensureMoltbotGateway(sandbox, c.env);
+    return c.json({ success: true, message: 'Gateway restarted', processId: (await findExistingMoltbotProcess(sandbox))?.id });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     return c.json({ error: errorMessage }, 500);

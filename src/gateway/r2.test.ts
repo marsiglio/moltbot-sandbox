@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mountR2Storage } from './r2';
+import { mountR2Storage, resetR2MountCache } from './r2';
 import { 
   createMockEnv, 
   createMockEnvWithR2, 
@@ -11,6 +11,7 @@ import {
 describe('mountR2Storage', () => {
   beforeEach(() => {
     suppressConsole();
+    resetR2MountCache();
   });
 
   describe('credential validation', () => {

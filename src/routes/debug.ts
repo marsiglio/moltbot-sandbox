@@ -9,6 +9,28 @@ import { findExistingMoltbotProcess } from '../gateway';
  */
 const debug = new Hono<AppEnv>();
 
+// GET /debug/gateway-state - Gateway state (ready, processId, lastStart, lastHealthCheck)
+debug.get('/gateway-state', async (c) => {
+  if (c.env.GatewayState) {
+    try {
+      const id = c.env.GatewayState.idFromName('moltbot');
+      const res = await c.env.GatewayState.get(id).fetch(new Request('http://do/state'));
+      const data = await res.json();
+      return c.json(data);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return c.json({ error: message }, 500);
+    }
+  }
+  return c.json({
+    gatewayReady: null,
+    gatewayProcessId: null,
+    lastGatewayStartAttempt: null,
+    lastHealthCheck: null,
+    message: 'GatewayState DO not bound (e.g. local dev or test)',
+  });
+});
+
 // GET /debug/version - Returns version info from inside the container
 debug.get('/version', async (c) => {
   const sandbox = c.get('sandbox');

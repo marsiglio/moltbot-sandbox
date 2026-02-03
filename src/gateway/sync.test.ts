@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { syncToR2 } from './sync';
+import { resetR2MountCache } from './r2';
 import { 
   createMockEnv, 
   createMockEnvWithR2, 
@@ -11,6 +12,7 @@ import {
 describe('syncToR2', () => {
   beforeEach(() => {
     suppressConsole();
+    resetR2MountCache();
   });
 
   describe('configuration checks', () => {
